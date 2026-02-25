@@ -191,6 +191,7 @@ class UploadResponse(BaseModel):
     workspace_id: str
     report_name:  str
     report_id:    str | None = None
+    dataset_id:   str | None = None   # ✅ ADDED
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -262,6 +263,16 @@ def upload_report(body: UploadRequest):
     if resp.status_code not in (200, 201, 202):
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
+    # ✅ 3.1 Extract Dataset ID from import response
+    dataset_id = None
+    try:
+        import_response = resp.json()
+        datasets = import_response.get("datasets", [])
+        if datasets:
+            dataset_id = datasets[0].get("id")
+    except Exception:
+        dataset_id = None
+
     # 4. Poll for report ID
     report_id = fetch_report_id(headers, body.workspace_id, body.report_name)
 
@@ -270,4 +281,5 @@ def upload_report(body: UploadRequest):
         workspace_id=body.workspace_id,
         report_name=body.report_name,
         report_id=report_id,
+        dataset_id=dataset_id,  # ✅ ADDED
     )
