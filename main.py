@@ -163,8 +163,7 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# ── ✅ CORS FIX (ADDED) ───────────────────────────────────────────────────────
-
+# ── ✅ CORS FIX ───────────────────────────────────────────────────────────────
 origins = [
     "https://id-preview--1115fb10-6ea8-4052-8d1b-31238016c02e.lovable.app",
 ]
@@ -176,14 +175,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 # ── Request / Response models ─────────────────────────────────────────────────
 class UploadRequest(BaseModel):
-    workspace_id: str = Field(..., example="90062faa-3344-4bf4-8dc9-f5f54f38d8bf", description="Power BI Workspace (Group) ID")
-    report_name:  str = Field(..., example="My New Report", description="Name to give the uploaded report")
+    workspace_id: str = Field(..., example="90062faa-3344-4bf4-8dc9-f5f54f38d8bf",
+                              description="Power BI Workspace (Group) ID")
+    report_name:  str = Field(..., example="My New Report",
+                              description="Name to give the uploaded report")
 
 
 class UploadResponse(BaseModel):
@@ -191,7 +191,7 @@ class UploadResponse(BaseModel):
     workspace_id: str
     report_name:  str
     report_id:    str | None = None
-    dataset_id:   str | None = None   # ✅ ADDED
+    dataset_id:   str | None = None
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -201,61 +201,87 @@ def get_access_token() -> str:
         authority=f"https://login.microsoftonline.com/{TENANT_ID}",
         client_credential=CLIENT_SECRET,
     )
+
     result = app_client.acquire_token_for_client(scopes=POWERBI_SCOPE)
+
     if "access_token" not in result:
-        raise HTTPException(status_code=500, detail=f"Token error: {result.get('error_description')}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Token error: {result.get('error_description')}"
+        )
+
     return result["access_token"]
 
 
 def download_empty_pbix() -> bytes:
     try:
-        blob_service = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
-        container    = blob_service.get_container_client(BLOB_CONTAINER)
-        blob         = container.get_blob_client(EMPTY_PBIX_NAME)
+        blob_service = BlobServiceClient.from_connection_string(
+            AZURE_STORAGE_CONNECTION_STRING
+        )
+        container = blob_service.get_container_client(BLOB_CONTAINER)
+        blob = container.get_blob_client(EMPTY_PBIX_NAME)
+
         return blob.download_blob().readall()
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Blob download failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Blob download failed: {str(e)}"
+        )
 
 
 def fetch_report_id(headers: dict, workspace_id: str, report_name: str) -> str | None:
     reports_url = f"{POWERBI_API}/groups/{workspace_id}/reports"
+
     for _ in range(8):
         time.sleep(3)
         resp = requests.get(reports_url, headers=headers)
+
         if resp.ok:
             for report in resp.json().get("value", []):
                 if report["name"].lower() == report_name.lower():
                     return report["id"]
+
     return None
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/", tags=["Health"])
 def root():
-    return {"status": "ok", "message": "Power BI Report Uploader is running. Visit /docs to use the API."}
+    return {
+        "status": "ok",
+        "message": "Power BI Report Uploader is running. Visit /docs to use the API."
+    }
 
 
 @app.post("/upload-report", response_model=UploadResponse, tags=["Power BI"])
 def upload_report(body: UploadRequest):
     """
-    Downloads the empty .pbix template from Azure Blob Storage and uploads it
-    to the specified Power BI workspace as a new report.
+    Downloads the empty .pbix template from Azure Blob Storage
+    and uploads it to the specified Power BI workspace.
+    Returns both report_id and dataset_id after import succeeds.
     """
-    # 1. Auth
+
+    # 1️⃣ Authenticate
     access_token = get_access_token()
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    # 2. Download template from blob
+    # 2️⃣ Download template from Blob Storage
     pbix_bytes = download_empty_pbix()
 
-    # 3. Upload to Power BI
+    # 3️⃣ Upload to Power BI (Import API)
     upload_url = (
         f"{POWERBI_API}/groups/{body.workspace_id}/imports"
         f"?datasetDisplayName={body.report_name}"
         "&nameConflict=CreateOrOverwrite"
     )
+
     files = {
-        "file": (f"{body.report_name}.pbix", pbix_bytes, "application/vnd.ms-powerbi.pbix")
+        "file": (
+            f"{body.report_name}.pbix",
+            pbix_bytes,
+            "application/vnd.ms-powerbi.pbix"
+        )
     }
 
     resp = requests.post(upload_url, headers=headers, files=files)
@@ -263,23 +289,58 @@ def upload_report(body: UploadRequest):
     if resp.status_code not in (200, 201, 202):
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
-    # ✅ 3.1 Extract Dataset ID from import response
-    dataset_id = None
-    try:
-        import_response = resp.json()
-        datasets = import_response.get("datasets", [])
-        if datasets:
-            dataset_id = datasets[0].get("id")
-    except Exception:
-        dataset_id = None
+    import_data = resp.json()
+    import_id = import_data.get("id")
 
-    # 4. Poll for report ID
-    report_id = fetch_report_id(headers, body.workspace_id, body.report_name)
+    if not import_id:
+        raise HTTPException(
+            status_code=500,
+            detail="Import ID not returned from Power BI."
+        )
+
+    # 4️⃣ Poll Import Status Until Succeeded
+    dataset_id = None
+    report_id = None
+
+    import_status_url = (
+        f"{POWERBI_API}/groups/{body.workspace_id}/imports/{import_id}"
+    )
+
+    for _ in range(15):  # wait up to ~45 seconds
+        time.sleep(3)
+
+        status_resp = requests.get(import_status_url, headers=headers)
+
+        if not status_resp.ok:
+            continue
+
+        status_json = status_resp.json()
+        state = status_json.get("importState")
+
+        if state == "Succeeded":
+            datasets = status_json.get("datasets", [])
+            reports = status_json.get("reports", [])
+
+            if datasets:
+                dataset_id = datasets[0].get("id")
+
+            if reports:
+                report_id = reports[0].get("id")
+
+            break
+
+        elif state == "Failed":
+            raise HTTPException(
+                status_code=500,
+                detail="Power BI import failed."
+            )
 
     return UploadResponse(
-        message="Report uploaded successfully" if report_id else "Upload accepted but report ID not yet confirmed",
+        message="Report uploaded successfully"
+                if dataset_id
+                else "Upload processing still in progress",
         workspace_id=body.workspace_id,
         report_name=body.report_name,
         report_id=report_id,
-        dataset_id=dataset_id,  # ✅ ADDED
+        dataset_id=dataset_id,
     )
