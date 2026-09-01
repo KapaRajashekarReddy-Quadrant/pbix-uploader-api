@@ -240,6 +240,8 @@
 
 """
 FastAPI app — Upload empty .pbix from Azure Blob Storage to a Power BI workspace.
+UPDATED: Supports reuse path (skips import if dataset_id provided).
+
 Run:  uvicorn main:app --reload
 Docs: http://localhost:8000/docs
 """
@@ -271,8 +273,8 @@ POWERBI_API   = "https://api.powerbi.com/v1.0/myorg"
 
 app = FastAPI(
     title="Power BI Report Uploader",
-    description="Downloads an empty .pbix from Azure Blob Storage and uploads it to a Power BI workspace.",
-    version="1.0.0",
+    description="Downloads an empty .pbix from Azure Blob Storage and uploads it to a Power BI workspace. Supports reuse of existing datasets.",
+    version="2.0.0",
 )
 
 # ── ✅ CORS FIX ───────────────────────────────────────────────────────────────
@@ -297,9 +299,10 @@ class UploadRequest(BaseModel):
                               description="Power BI Workspace (Group) ID")
     report_name:  str = Field(..., example="My New Report",
                               description="Name to give the uploaded report")
-    dataset_name: str | None = Field(None, example="Manufacturing_Analysis",
-                              description="Name to give the underlying semantic model (dataset). "
-                                          "Defaults to report_name if not provided.")
+    dataset_id:   str | None = Field(None, example="12345678-1234-1234-1234-123456789012",
+                                     description="[REUSE PATH] Existing dataset ID to bind to (skips import)")
+    report_id:    str | None = Field(None, example="87654321-4321-4321-4321-210987654321",
+                                     description="[REUSE PATH] Existing report ID to reuse")
 
 
 class UploadResponse(BaseModel):
@@ -312,6 +315,7 @@ class UploadResponse(BaseModel):
 
 
 def get_access_token() -> str:
+    """Acquire Power BI API access token."""
     app_client = msal.ConfidentialClientApplication(
         CLIENT_ID,
         authority=f"https://login.microsoftonline.com/{TENANT_ID}",
@@ -330,6 +334,7 @@ def get_access_token() -> str:
 
 
 def download_empty_pbix() -> bytes:
+    """Download empty PBIX template from Azure Blob Storage."""
     try:
         blob_service = BlobServiceClient.from_connection_string(
             AZURE_STORAGE_CONNECTION_STRING
@@ -347,6 +352,7 @@ def download_empty_pbix() -> bytes:
 
 
 def fetch_report_id(headers: dict, workspace_id: str, report_name: str) -> str | None:
+    """Poll Power BI to find a report by name (waits up to ~24 seconds)."""
     reports_url = f"{POWERBI_API}/groups/{workspace_id}/reports"
 
     for _ in range(8):
@@ -371,20 +377,50 @@ def root():
 
 @app.post("/upload-report", response_model=UploadResponse, tags=["Power BI"])
 def upload_report(body: UploadRequest):
+    """
+    Upload a report to Power BI.
+    
+    Two modes:
+    
+    1. **NEW dataset** (dataset_id not provided):
+       - Download empty PBIX from blob storage
+       - Upload to Power BI (creates new dataset + report)
+       - Poll for completion and return new IDs
+    
+    2. **REUSE dataset** (dataset_id provided):
+       - Skip import entirely
+       - Return the existing dataset_id + report_id
+       - Frontend skips Lakehouse/Deploy steps (dataset already exists)
+    """
 
     # 1️⃣ Authenticate
     access_token = get_access_token()
     headers = {"Authorization": f"Bearer {access_token}"}
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # REUSE PATH: If dataset_id is provided, skip import entirely
+    # ═══════════════════════════════════════════════════════════════════════════
+    if body.dataset_id:
+        print(f"[REUSE MODE] Skipping import — reusing dataset {body.dataset_id}")
+        return UploadResponse(
+            message="Report reused (semantic model already exists)",
+            workspace_id=body.workspace_id,
+            report_name=body.report_name,
+            report_id=body.report_id or "reused",  # Pass through existing report_id
+            dataset_id=body.dataset_id,  # Use existing dataset_id
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # NEW DATASET PATH: Standard import flow
+    # ═══════════════════════════════════════════════════════════════════════════
+
     # 2️⃣ Download template from Blob Storage
     pbix_bytes = download_empty_pbix()
 
     # 3️⃣ Upload to Power BI (Import API)
-    dataset_display_name = body.dataset_name or body.report_name
-
     upload_url = (
         f"{POWERBI_API}/groups/{body.workspace_id}/imports"
-        f"?datasetDisplayName={dataset_display_name}"
+        f"?datasetDisplayName={body.report_name}"
         "&nameConflict=CreateOrOverwrite"
     )
 
@@ -417,6 +453,7 @@ def upload_report(body: UploadRequest):
         f"{POWERBI_API}/groups/{body.workspace_id}/imports/{import_id}"
     )
 
+    # 4️⃣ Poll for import completion
     for _ in range(15):
         time.sleep(3)
 
@@ -446,7 +483,7 @@ def upload_report(body: UploadRequest):
                 detail="Power BI import failed."
             )
 
-    # 🔥 NEW LOGIC ADDED: Disable SSO for DirectQuery (Service Principal Mapping)
+    # 5️⃣ Disable SSO for DirectQuery (Service Principal Mapping)
     if dataset_id:
         datasources_url = f"{POWERBI_API}/groups/{body.workspace_id}/datasets/{dataset_id}/datasources"
         ds_resp = requests.get(datasources_url, headers=headers)
